@@ -10,7 +10,7 @@ def format_queue_prompt(pack: MesStatePack) -> str:
     state_hints = {
         "idle": "[场景提示：用户发完上述内容后，停下了手中的动作。]",
         "typing": "[场景提示：用户发完上述内容后，似乎还在继续打字，思绪可能还未完全表达完。]",
-        "cleared": "[场景提示：用户在输入框里编辑了一些内容，但最终默默删除了，没有发送出来。]"
+        "cleared": "[场景提示：在发送上述内容后，用户开始在输入框里编辑新的内容，但最终默默删除了，没有发出新的消息，可能是欲言又止]"
     }
     
     state_hint = state_hints.get(pack.user_state, "")

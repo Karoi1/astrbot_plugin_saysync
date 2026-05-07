@@ -14,7 +14,7 @@ class SessionScheduler:
     _user_status: Dict[str, UserStatus] = {}         # 每个chat_id对应的用户输入状态
     _max_size: int = 3                               # 最大队列长度
     _expire_time: float = 10                         # 超时后立刻下锅
-    dead_lock_threshold = 30                         # 30秒没收到LLM回复，锅烧糊了，得关火下新的
+    _dead_lock_threshold = 30                         # 30秒没收到LLM回复，锅烧糊了，得关火下新的
 
     def __init__(self, max_size=3, expire_time=10, dead_lock_threshold=30):
         pass

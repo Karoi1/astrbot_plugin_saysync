@@ -1,15 +1,17 @@
 import time
+import re
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest, LLMResponse
+from astrbot.core.message.components import Plain
 
 from .core import prompt_template
 from .core.scheduler import SessionScheduler
 from .core.models import SchedulerResult
 
 
-@register("chatqueue", "YourName", "挂起式队列感知插件", "1.0.0")
+@register("知音", "Robin", "安静倾听，告别一问一答的机械感", "1.0.1")
 class ChatQueuePlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
@@ -21,11 +23,12 @@ class ChatQueuePlugin(Star):
         )
 
     # ==========================================
-    # 接线员 A & B：事件总入口 (极高优先级截胡)
+    # 接线员 A & B：事件总入口
     # ==========================================
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=100)
+    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=-10)
     async def on_message(self, event: AstrMessageEvent):
-        logger.info("收到用户推送了")
+        """挂起最后一个收到的消息"""
+        # logger.info("收到用户推送了")
         chat_id = event.unified_msg_origin
         # --- 分支 B：处理底层输入状态推送 ---
         if not event.message_str:
@@ -67,6 +70,7 @@ class ChatQueuePlugin(Star):
     # ==========================================
     @filter.on_llm_request(priority=10)
     async def hijack_llm_request(self, event: AstrMessageEvent, req: ProviderRequest):
+        """修改prompt和system prompt"""
         # 检查暗号：是不是我们放行的事件？
         logger.info("收到LLM request")
         if not event.get_extra("chatqueue_pending"):
@@ -91,14 +95,25 @@ class ChatQueuePlugin(Star):
     # ==========================================
     @filter.on_llm_response(priority=100)
     async def force_unlock_on_resp(self, event: AstrMessageEvent, resp: LLMResponse):
+        """解锁上锁的会话"""
         logger.info("收到LLM response")
         # 只要 LLM 给出了响应（哪怕报错），立刻通知调度器解锁
         chat_id = event.unified_msg_origin
         self.scheduler.unlock_session(chat_id)
 
+        # ==========================================
+
     # ==========================================
-    # 辅助方法：解析 QQ 输入状态协议
+    # 辅助方法
     # ==========================================
+    # @filter.on_llm_response()
+    async def delete_space(self, event: AstrMessageEvent, resp: LLMResponse):
+        """删除换行符"""
+        if resp.completion_text:
+            result, count = re.subn(r'[\r\n]+', '', resp.completion_text)
+            resp.completion_text = result
+            # logger.info(f"删除了 {count} 个换行符")
+
     def _parse_aiocqhttp_input_status(self, event: AstrMessageEvent, chat_id: str) -> bool:
         if event.get_platform_name() != "aiocqhttp":
             return False
@@ -131,3 +146,51 @@ class ChatQueuePlugin(Star):
     # ==========================================
     async def terminate(self):
         await self.scheduler.terminate()
+
+
+    @filter.command("helloworld")
+    async def helloworld(self, event: AstrMessageEvent):
+        yield event.plain_result("Hello!")
+        event.stop_event()
+
+    @filter.command("成语接龙")
+    async def handle_empty_mention(self, event: AstrMessageEvent):
+        """成语接龙具体实现"""
+        try:
+            yield event.plain_result("请发送一个成语~")
+
+            # 具体的会话控制器使用方法
+            @session_waiter(timeout=60, record_history_chains=False) # 注册一个会话控制器，设置超时时间为 60 秒，不记录历史消息链
+            async def empty_mention_waiter(controller: SessionController, event: AstrMessageEvent):
+                idiom = event.message_str # 用户发来的成语，假设是 "一马当先"
+
+                if idiom == "退出":   # 假设用户想主动退出成语接龙，输入了 "退出"
+                    await event.send(event.plain_result("已退出成语接龙~"))
+                    controller.stop()    # 停止会话控制器，会立即结束。
+                    return
+
+                if len(idiom) != 4:   # 假设用户输入的不是4字成语
+                    await event.send(event.plain_result("成语必须是四个字的呢~"))  # 发送回复，不能使用 yield
+                    return
+                    # 退出当前方法，不执行后续逻辑，但此会话并未中断，后续的用户输入仍然会进入当前会话
+
+                # ...
+                message_result = event.make_result()
+                message_result.chain = [Comp.Plain("先见之明")] # import astrbot.api.message_components as Comp
+                await event.send(message_result) # 发送回复，不能使用 yield
+
+                controller.keep(timeout=60, reset_timeout=True) # 重置超时时间为 60s，如果不重置，则会继续之前的超时时间计时。
+
+                # controller.stop() # 停止会话控制器，会立即结束。
+                # 如果记录了历史消息链，可以通过 controller.get_history_chains() 获取历史消息链
+
+            try:
+                await empty_mention_waiter(event)
+            except TimeoutError as _: # 当超时后，会话控制器会抛出 TimeoutError
+                yield event.plain_result("你超时了！")
+            except Exception as e:
+                yield event.plain_result("发生错误，请联系管理员: " + str(e))
+            finally:
+                event.stop_event()
+        except Exception as e:
+            logger.error("handle_empty_mention error: " + str(e))

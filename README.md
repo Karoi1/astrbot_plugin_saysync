@@ -1,14 +1,19 @@
-# astrbot-plugin-helloworld
+# astrbot-plugin-realchat
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+✨ 懂你的欲言又止
+不是更聪明的 AI，而是更懂倾听的伙伴。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+传统的 AI 聊天就像对着一堵墙说话——你发一句，它秒回一句。机械、冰冷，没有“交流”的呼吸感。
 
-# Supports
+realchat 彻底改变了这种交互模式。它会安静地等你把想说的话全部打完，它会察觉你打字时的停顿，甚至能感知到你打了一长串字又默默删除的犹豫。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+它不会像个客服一样问你“你是不是删了什么？”，而是会像真人一样，用最温柔的方式给你一个台阶。
+
+🎬 想象一下这样的场景
+你：（打字）“其实我今天……”你：（犹豫了一下，把后面的话全删了，什么都没发）AI：（没有秒回，而是安静了几秒）AI：“……嗯？怎么突然安静了。”你：“没……没事。”AI：“好。我在的。”
+
+又或者：
+
+你：（噼里啪啦连发三条消息吐槽今天遇到的事）AI：（没有打断你，而是等你说完，思考了一会儿）AI：“啊……听起来真的是很麻烦的一天呢。辛苦了。”(期间，当你还在狂敲键盘时，AI 会默默发来一个“…”，告诉你它在听。)
+
+这就是 realchat 想要带来的体验。
