@@ -6,7 +6,7 @@ from astrbot.api import logger
 from astrbot.api.provider import ProviderRequest
 import json
 from enum import Enum
-from . import prompt_template
+from .core import prompt_template
 
 class MesStatePack:
     def __init__(self, messages: list, user_state: str):

@@ -4,8 +4,8 @@ from enum import Enum
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
-from . import prompt_template
-from .prompt_template import MesStatePack
+from .core import prompt_template
+from .core.prompt_template import MesStatePack
 
 class UserStatus:
     # ... 保持你原有的状态机代码不变 ...
