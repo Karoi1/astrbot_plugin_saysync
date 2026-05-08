@@ -4,10 +4,10 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest, LLMResponse
 
-from .core.proactive_manager import ProactiveManager
+from .core import ProactiveManager
 from .core import prompt_template
-from .core.scheduler import SessionScheduler
-from .core.models import SchedulerResult, ProactiveTask, ProactiveType
+from .core import SessionScheduler
+from .core.models import *
 from .core.models import _log
 
 # ====== 日志开关：True 打印所有日志，False 静默 ======
@@ -136,6 +136,8 @@ class ChatQueuePlugin(Star):
             if not isinstance(raw, dict):
                 return
             
+
+            # ========== 提取输入状态 ==========
             if (raw.get("post_type") == "notice" and
                 raw.get("notice_type") == "notify" and
                 raw.get("sub_type") == "input_status" and "status_text" in raw):

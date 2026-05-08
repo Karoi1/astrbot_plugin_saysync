@@ -2,8 +2,6 @@ import asyncio
 from enum import Enum
 import uuid
 import time
-from typing import TYPE_CHECKING
-
 
 from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
 from astrbot.core.platform.platform_metadata import PlatformMetadata
