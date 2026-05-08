@@ -1,19 +1,36 @@
 import asyncio
 from enum import Enum
-from typing import Dict
 import uuid
 import time
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
-    from astrbot.core.platform.platform_metadata import PlatformMetadata
-    from astrbot.core.platform.message_type import MessageType
 
+from astrbot.core.platform.astrbot_message import AstrBotMessage, MessageMember
+from astrbot.core.platform.platform_metadata import PlatformMetadata
+from astrbot.core.platform.message_type import MessageType
+from astrbot.api import logger
+
+
+
+def _log(enable: bool, level: str, msg: str, *args, **kwargs):
+    """内部日志方法，受 enable_logger 控制"""
+    if not enable:
+        return
+    log_fn = getattr(logger, level, None)
+    if log_fn and callable(log_fn):
+        log_fn(msg, *args, **kwargs)
 
 class ProactiveType(Enum):
-    FAREWELL = "farewell"     # 结束后的补充
-    CLEARED = "cleared"       # 欲言又止的试探
+    FAREWELL = "FAREWELL"     # 结束后的补充
+    CLEARED = "CLEARED"       # 欲言又止的试探
+
+class ProactiveEventResult(Enum):
+    KILL = "KILL"
+    PROCESS = "PROCESS"
+
+class SchedulerResult(Enum):
+    KILL = "KILL"
+    PROCESS = "PROCESS"
 
 class ProactiveTask:
     """主动说话任务单"""
@@ -34,7 +51,7 @@ class UserStatus:
 
     def __init__(self):
         self._mes_sent: bool = False
-        self.sm: self.StateMachine = self.StateMachine.idle
+        self.sm = self.StateMachine.idle
 
     def set_mes_sent(self):
         self.reset()
@@ -89,10 +106,6 @@ class UserStatus:
             return "cleared"
         return self.sm.name
 
-class SchedulerResult(Enum):
-    KILL = "KILL"
-    PROCESS = "PROCESS"
-
 class SessionContext:
     def __init__(self):
         # 消息包
@@ -107,7 +120,7 @@ class SessionContext:
 
 class SessionSkin:
     """
-    会话皮肤：保存真实 Event 的静态特征，用于后续伪造主动说话的 Event。
+    会话壳：保存真实 Event 的静态特征，用于后续伪造主动说话的 Event。
     它是纯数据的克隆体，不包含任何控制流逻辑。
     """
     def __init__(self):
@@ -122,12 +135,12 @@ class SessionSkin:
         self.bot = None
 
     def is_ready(self) -> bool:
-        """检查皮肤是否已经收集完整，可以用来伪造 Event"""
+        """检查壳是否已经收集完整，可以用来伪造 Event"""
         return self.platform_meta is not None and self.unified_msg_origin != ""
 
     def clone_message_obj(self, prompt: str = "") -> 'AstrBotMessage':
         """
-        根据保存的皮肤，伪造一个全新的 AstrBotMessage 对象。
+        根据保存的壳，伪造一个全新的 AstrBotMessage 对象。
         动态特征（如 message_id, raw_message）会自动生成假数据。
         """
         # 动态导入，避免在非运行时环境报错
