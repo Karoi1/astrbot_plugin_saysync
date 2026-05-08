@@ -4,7 +4,7 @@ from typing import Optional, Dict
 
 from astrbot.api import logger
 
-from .models import SessionContext, UserStatus,SchedulerResult
+from .models import SessionContext, UserStatus,SchedulerResult,SessionSkin
 from .prompt_template import MesStatePack
 
 
@@ -12,12 +12,25 @@ class SessionScheduler:
     """后厨，正在思考如何下锅。"""
     _sessions: Dict[str, SessionContext] = {}         # 每个chat_id对应一个session，会话隔离
     _user_status: Dict[str, UserStatus] = {}         # 每个chat_id对应的用户输入状态
+    _skins: Dict[str, SessionSkin] = {}              # 按 chat_id 存储皮肤外壳
     _max_size: int = 3                               # 最大队列长度
     _expire_time: float = 10                         # 超时后立刻下锅
     _dead_lock_threshold = 30                         # 30秒没收到LLM回复，锅烧糊了，得关火下新的
+    # ========== 欲言又止等待室 ==========
+    _cleared_timers: Dict[str, asyncio.Task] = {}
+    _cleared_timeout_duration: float = 20.0           # 默认等待 20 秒
+    _on_cleared_timeout = None                        # 主逻辑传进来的回调函数
 
-    def __init__(self, max_size=3, expire_time=10, dead_lock_threshold=30):
-        pass
+    def __init__(self, max_size=3, expire_time=10, dead_lock_threshold=30, on_cleared_timeout=None):
+        self._sessions = {}         
+        self._user_status = {}  
+        self._skins = {}   
+        self._max_size = max_size    
+        self._expire_time = expire_time     
+        self._dead_lock_threshold = dead_lock_threshold         
+        self._cleared_timers: Dict[str, asyncio.Task] = {}
+        self._cleared_timeout_duration: float = 20.0      
+        self._on_cleared_timeout = on_cleared_timeout                   
 
     def _get_session(self, chat_id: str) -> SessionContext:
         """找chat_id对应session。这桌客户之前点没点过菜来着"""
@@ -30,6 +43,10 @@ class SessionScheduler:
         if chat_id not in self._user_status:
             self._user_status[chat_id] = UserStatus()
         return self._user_status[chat_id]
+    
+    def get_skin(self, chat_id: str) -> 'SessionSkin | None':
+        """获取指定会话的皮肤"""
+        return self._skins.get(chat_id)
 
     # ==========================================
     # 对外接口
@@ -39,7 +56,38 @@ class SessionScheduler:
         """插件服务员说客户想自定口味，更新chat_id对应session的输入状态"""
         curr_status = self._get_user_status(chat_id)
         curr_status.set_state(is_typing)
-        logger.debug(f"[Scheduler][{chat_id}] 用户状态更新: {curr_status.sm.name}")
+        logger.info(f"[Scheduler][{chat_id}] 用户状态更新: {curr_status.sm.name}")
+
+        # ========== 欲言又止感知逻辑 ==========
+        if curr_status.sm == UserStatus.StateMachine.cleared or curr_status.sm == UserStatus.StateMachine.cleared_sure:
+            logger.info(f"[Scheduler][{chat_id}] 检测到欲言又止，启动 20s 等待室。")
+            self._start_cleared_timer(chat_id)
+        elif curr_status.sm == UserStatus.StateMachine.typing:
+            # 如果用户又开始打字了，或者发了真消息，立刻销毁等待室
+            logger.info(f"[Scheduler][{chat_id}] 等待室关闭。")
+            self._cancel_cleared_timer(chat_id)
+
+    def update_skin(self, chat_id: str, event) -> None:
+        """
+        从真实的 Event 中提取静态特征，更新或创建会话皮肤。
+        由 Plugin 层调用。
+        """
+        if chat_id not in self._skins:
+            self._skins[chat_id] = SessionSkin()
+            
+        skin = self._skins[chat_id]
+        skin.platform_meta = event.platform_meta
+        skin.msg_type = event.get_message_type()
+        skin.self_id = event.get_self_id()
+        skin.session_id = event.get_session_id()
+        skin.group_id = event.get_group_id()
+        skin.sender = event.message_obj.sender
+        skin.unified_msg_origin = event.unified_msg_origin
+
+        if skin.bot is None:
+            skin.bot = getattr(event, 'bot', None)
+            if skin.bot:
+                logger.info(f"[主动说话] 已缓存 {chat_id} 的真实 Bot 客户端。")
 
     def submit_message(self, chat_id: str, text: str) -> asyncio.Future:
         """插件服务员送来了某桌客户的餐牌，挂起餐牌等待入锅"""
@@ -85,7 +133,7 @@ class SessionScheduler:
                 session.is_processing = False
             else:
                 # 上一轮还在跑，当前事件放弃
-                logger.debug(f"[Scheduler][{chat_id}] 上一轮处理中，当前事件放弃争抢。")
+                logger.info(f"[Scheduler][{chat_id}] 上一轮处理中，当前事件放弃争抢。")
                 return None
 
         # 2. 【防御】如果没有货了（可能被极端并发情况清空了）
@@ -131,6 +179,11 @@ class SessionScheduler:
                 session.timer_task.cancel()
             if session.active_future and not session.active_future.done():
                 session.active_future.set_result(SchedulerResult.KILL)
+        
+        for chat_id, timer in self._cleared_timers.items():
+            if not timer.done():
+                timer.cancel()
+        self._cleared_timers.clear()
 
     # ==========================================
     # 内部方法
@@ -153,3 +206,41 @@ class SessionScheduler:
                 session.active_future.set_result(SchedulerResult.PROCESS)
         except asyncio.CancelledError:
             pass # 被新消息重置了，静默退出
+
+
+    def _start_cleared_timer(self, chat_id: str):
+        """启动或重置欲言又止计时器"""
+        # 如果已经有计时器在跑了，先取消旧的（重置 20 秒）
+        self._cancel_cleared_timer(chat_id)
+        self._cleared_timers[chat_id] = asyncio.create_task(
+            self._cleared_timeout_handler(chat_id)
+        )
+        logger.info(f"[ClearedTimer][{chat_id}] 等待室计时器已启动/重置。")
+
+    def _cancel_cleared_timer(self, chat_id: str):
+        """取消欲言又止计时器（用户恢复打字或发了真消息）"""
+        timer = self._cleared_timers.pop(chat_id, None)
+        if timer and not timer.done():
+            timer.cancel()
+            logger.info(f"[Scheduler][{chat_id}] 用户恢复输入，已取消欲言又止等待。")
+
+    async def _cleared_timeout_handler(self, chat_id: str):
+        """欲言又止计时器到期处理"""
+        try:
+            await asyncio.sleep(self._cleared_timeout_duration)
+            logger.info(f"[Scheduler][{chat_id}] 欲言又止等待 20s 到期，准备触发回调。")
+            
+            # 触发主逻辑的回调
+            if self._on_cleared_timeout:
+                # 注意：这里不能 await，因为主逻辑可能会做耗时操作（拉历史等）
+                # 把它包装成一个 Task 丢进事件循环，让 Scheduler 立刻释放
+                asyncio.create_task(self._on_cleared_timeout(chat_id))
+            else:
+                logger.warning(f"[Scheduler][{chat_id}] 欲言又止回调函数未绑定！")
+                
+        except asyncio.CancelledError:
+            pass # 被正常取消了，静默退出
+        except Exception as e:
+            logger.error(f"[Scheduler][{chat_id}] 欲言又止处理器异常: {e}", exc_info=True)
+        finally:
+            self._cleared_timers.pop(chat_id, None)
