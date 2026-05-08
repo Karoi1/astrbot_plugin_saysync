@@ -4,7 +4,7 @@ from typing import Optional, Dict
 
 from astrbot.api import logger
 
-from .models import SessionContext, UserStatus,SchedulerResult,SessionSkin
+from .models import SessionContext, UserStatus, SchedulerResult, SessionSkin, ProactiveTask, ProactiveType
 from .prompt_template import MesStatePack
 
 
@@ -16,21 +16,19 @@ class SessionScheduler:
     _max_size: int = 3                               # 最大队列长度
     _expire_time: float = 10                         # 超时后立刻下锅
     _dead_lock_threshold = 30                         # 30秒没收到LLM回复，锅烧糊了，得关火下新的
-    # ========== 欲言又止等待室 ==========
-    _cleared_timers: Dict[str, asyncio.Task] = {}
-    _cleared_timeout_duration: float = 20.0           # 默认等待 20 秒
-    _on_cleared_timeout = None                        # 主逻辑传进来的回调函数
-
-    def __init__(self, max_size=3, expire_time=10, dead_lock_threshold=30, on_cleared_timeout=None):
+    
+    def __init__(self, max_size=3, expire_time=10, dead_lock_threshold=30, on_proactive_ready=None):
         self._sessions = {}         
         self._user_status = {}  
         self._skins = {}   
         self._max_size = max_size    
         self._expire_time = expire_time     
         self._dead_lock_threshold = dead_lock_threshold         
-        self._cleared_timers: Dict[str, asyncio.Task] = {}
-        self._cleared_timeout_duration: float = 20.0      
-        self._on_cleared_timeout = on_cleared_timeout                   
+        
+        # ========== 统一的主动说话引擎底层 ==========
+        self._proactive_tasks: Dict[str, asyncio.Task] = {} 
+        self._on_proactive_ready = on_proactive_ready  # 主逻辑统一的接单回调
+        # =======================================================================
 
     def _get_session(self, chat_id: str) -> SessionContext:
         """找chat_id对应session。这桌客户之前点没点过菜来着"""
@@ -56,16 +54,16 @@ class SessionScheduler:
         """插件服务员说客户想自定口味，更新chat_id对应session的输入状态"""
         curr_status = self._get_user_status(chat_id)
         curr_status.set_state(is_typing)
-        logger.info(f"[Scheduler][{chat_id}] 用户状态更新: {curr_status.sm.name}")
+        logger.debug(f"[Scheduler][{chat_id}] 用户状态更新: {curr_status.sm.name}")
 
-        # ========== 欲言又止感知逻辑 ==========
-        if curr_status.sm == UserStatus.StateMachine.cleared or curr_status.sm == UserStatus.StateMachine.cleared_sure:
-            logger.info(f"[Scheduler][{chat_id}] 检测到欲言又止，启动 20s 等待室。")
+        # ========== 欲言又止感知逻辑 -> 转化为提交主动任务 ==========
+        if curr_status.sm in (UserStatus.StateMachine.cleared, UserStatus.StateMachine.cleared_sure):
+            logger.info(f"[ProactiveTask][{chat_id}] 检测到欲言又止，提交延迟主动任务。")
             self._start_cleared_timer(chat_id)
         elif curr_status.sm == UserStatus.StateMachine.typing:
-            # 如果用户又开始打字了，或者发了真消息，立刻销毁等待室
-            logger.info(f"[Scheduler][{chat_id}] 等待室关闭。")
-            self._cancel_cleared_timer(chat_id)
+            # 如果用户又开始打字了，立刻杀掉当前可能存在的主动任务
+            logger.debug(f"[ProactiveTask][{chat_id}] 用户恢复输入，取消主动任务。")
+            self._cancel_proactive_task(chat_id)
 
     def update_skin(self, chat_id: str, event) -> None:
         """
@@ -91,8 +89,13 @@ class SessionScheduler:
 
     def submit_message(self, chat_id: str, text: str) -> asyncio.Future:
         """插件服务员送来了某桌客户的餐牌，挂起餐牌等待入锅"""
+        # ========== 防御：发了真消息，立刻取消任何主动任务等待 ==========
+        self._cancel_proactive_task(chat_id)
+        # =======================================================================
+        
         session = self._get_session(chat_id)
-        send_flag = self._get_user_status(chat_id).set_mes_sent()
+        self._get_user_status(chat_id).set_mes_sent()
+        
         # 1. 【杀旧】干掉正在傻等的旧协程
         if session.active_future and not session.active_future.done():
             session.active_future.set_result(SchedulerResult.KILL)
@@ -168,22 +171,21 @@ class SessionScheduler:
         if session and session.is_processing:
             session.is_processing = False
             logger.info(f"[Scheduler][{chat_id}] 会话处理完成，已解锁。")
-            # 注意：这里不需要主动触发下一轮。
-            # 如果在处理期间有新消息，它们会乖乖躺在队列里。
-            # 等待下一次用户发消息或定时器自然触发时，prepare_release 会发现锁开了且队列有货，自然接管。
 
     async def terminate(self):
         """插件卸载时的清理工作"""
+        # 清理排队和挂起
         for chat_id, session in self._sessions.items():
             if session.timer_task and not session.timer_task.done():
                 session.timer_task.cancel()
             if session.active_future and not session.active_future.done():
                 session.active_future.set_result(SchedulerResult.KILL)
         
-        for chat_id, timer in self._cleared_timers.items():
-            if not timer.done():
-                timer.cancel()
-        self._cleared_timers.clear()
+        # 清理统一的主动任务计时器（修复了旧版的 _cleared_timers 拼写错误）
+        for chat_id, task in self._proactive_tasks.items():
+            if not task.done():
+                task.cancel()
+        self._proactive_tasks.clear()
 
     # ==========================================
     # 内部方法
@@ -202,45 +204,47 @@ class SessionScheduler:
             session = self._sessions.get(chat_id)
             # 只有当有凭证在等待，且没有在处理中时，才唤醒
             if session and session.active_future and not session.active_future.done() and not session.is_processing:
-                logger.debug(f"[Scheduler][{chat_id}] 定时器到期，触发唤醒")
+                logger.info(f"[Scheduler][{chat_id}] 定时器到期，触发唤醒")
                 session.active_future.set_result(SchedulerResult.PROCESS)
         except asyncio.CancelledError:
             pass # 被新消息重置了，静默退出
 
 
     def _start_cleared_timer(self, chat_id: str):
-        """启动或重置欲言又止计时器"""
-        # 如果已经有计时器在跑了，先取消旧的（重置 20 秒）
-        self._cancel_cleared_timer(chat_id)
-        self._cleared_timers[chat_id] = asyncio.create_task(
-            self._cleared_timeout_handler(chat_id)
+        """启动或重置欲言又止任务（底层走统一提交）"""
+        task = ProactiveTask(
+            chat_id=chat_id,
+            task_type=ProactiveType.CLEARED,
+            instruction="[底层系统提示：用户刚才在输入框里编辑了内容，但最终默默删除了。请结合语境温柔试探一句，绝对禁止直接点破，20字以内。]",
+            delay=20.0
         )
-        logger.info(f"[ClearedTimer][{chat_id}] 等待室计时器已启动/重置。")
+        self._submit_proactive_task(task)
 
-    def _cancel_cleared_timer(self, chat_id: str):
-        """取消欲言又止计时器（用户恢复打字或发了真消息）"""
-        timer = self._cleared_timers.pop(chat_id, None)
-        if timer and not timer.done():
-            timer.cancel()
-            logger.info(f"[Scheduler][{chat_id}] 用户恢复输入，已取消欲言又止等待。")
+    def _submit_proactive_task(self, task: ProactiveTask):
+        """提交一个主动说话任务（带延迟）。如果该会话已有任务，会被新任务顶掉。"""
+        self._cancel_proactive_task(task.chat_id) # 统一取消旧任务
+        self._proactive_tasks[task.chat_id] = asyncio.create_task(
+            self._proactive_engine(task)
+        )
+        logger.info(f"[ProactiveTask][{task.chat_id}] 已提交任务: {task.task_type.value}，延迟 {task.delay}s")
 
-    async def _cleared_timeout_handler(self, chat_id: str):
-        """欲言又止计时器到期处理"""
+    def _cancel_proactive_task(self, chat_id: str):
+        """取消当前会话的主动说话任务（发真消息或重新打字时调用）"""
+        task = self._proactive_tasks.pop(chat_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _proactive_engine(self, task: ProactiveTask):
+        """统一的主动说话引擎：等待 -> 唤醒主逻辑 -> 推流"""
         try:
-            await asyncio.sleep(self._cleared_timeout_duration)
-            logger.info(f"[Scheduler][{chat_id}] 欲言又止等待 20s 到期，准备触发回调。")
-            
-            # 触发主逻辑的回调
-            if self._on_cleared_timeout:
-                # 注意：这里不能 await，因为主逻辑可能会做耗时操作（拉历史等）
-                # 把它包装成一个 Task 丢进事件循环，让 Scheduler 立刻释放
-                asyncio.create_task(self._on_cleared_timeout(chat_id))
+            await asyncio.sleep(task.delay)
+            logger.info(f"[ProactiveTask][{task.chat_id}] 任务 {task.task_type.value} 延迟结束，唤醒主逻辑。")
+            # 唤醒主逻辑
+            if self._on_proactive_ready:
+                asyncio.create_task(self._on_proactive_ready(task))
             else:
-                logger.warning(f"[Scheduler][{chat_id}] 欲言又止回调函数未绑定！")
-                
+                logger.warning(f"[ProactiveTask][{task.chat_id}] 引擎未绑定主逻辑回调！")
         except asyncio.CancelledError:
-            pass # 被正常取消了，静默退出
-        except Exception as e:
-            logger.error(f"[Scheduler][{chat_id}] 欲言又止处理器异常: {e}", exc_info=True)
+            pass # 被正常取消，静默退出
         finally:
-            self._cleared_timers.pop(chat_id, None)
+            self._proactive_tasks.pop(task.chat_id, None)
