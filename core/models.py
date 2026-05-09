@@ -19,8 +19,23 @@ def _log(enable: bool, level: str, msg: str, *args, **kwargs):
         log_fn(msg, *args, **kwargs)
 
 class ProactiveType(Enum):
-    FAREWELL = "FAREWELL"     # 结束后的补充
-    CLEARED = "CLEARED"       # 欲言又止的试探
+    PROBE = "察觉到对方欲言又止、含糊其辞，内心产生想要轻巧试探、挖掘真实想法的好奇心。"
+    FAREWELL = "察觉到对话即将终结或对方已无继续攀谈的意愿，内心升起道别离场的冲动。"
+    SUPPLEMENT = "话音刚落，脑海中突然闪过遗漏的细节或新的灵感，产生“对了对了，还有这个”的自然补充冲动。"
+    COMFORT = "敏锐捕捉到对方情绪低落或受挫，内心泛起不忍或共情，想要给予温柔安抚的冲动。"
+    TOPIC_SHIFT = "察觉到当前话题陷入死胡同或尴尬冷场，为了化解气氛，内心想要生硬但努力地转移话题的冲动。"
+    NUDGE = "面对对方长时间的沉默（思考/犹豫），感到些许无聊或急切，想要用符合自己性格的方式轻轻戳一下、催促一下的冲动。"
+    YIELD = "意识到自己踩雷、说错话或察觉到对方的抗拒，内心拉响警报，想要立刻给出台阶、见好就收的退让冲动。"
+    TEASE = "看着对方上钩或犯错，内心产生恶作剧般的戏谑感，想要停顿一下再抛出吐槽或玩笑的冲动。"
+
+    def __str__(self):
+        # 注意这里使用的是中文全角冒号“：”
+        return f"- {self.name}：{self.value}"
+    
+    @classmethod
+    def formatted(cls):
+        """类方法：返回该枚举下所有成员格式化后的完整字符串"""
+        return "\n".join(str(item) for item in cls)
 
 class ProactiveEventResult(Enum):
     KILL = "KILL"
@@ -32,11 +47,12 @@ class SchedulerResult(Enum):
 
 class ProactiveTask:
     """主动说话任务单"""
-    def __init__(self, chat_id: str, task_type: ProactiveType, instruction: str, delay: float = 20.0):
+    def __init__(self, chat_id: str, task_type: ProactiveType, instruction: str, mindflow: str, delay: float = 20.0):
         self.chat_id = chat_id
-        self.task_type = task_type
-        self.instruction = instruction  # 纯粹的指令 prompt
         self.delay = delay
+        self.task_type = task_type      #类型
+        self.instruction = instruction  # 草稿
+        self.mindflow = mindflow        # 当时思绪
         self.created_at = time.time()
 
 class UserStatus:

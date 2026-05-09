@@ -1,6 +1,7 @@
 import asyncio
 from typing import Dict
 
+from .prompt_template import PROMPT4MENTALPULL
 from .models import SessionSkin, ProactiveEventResult, ProactiveTask
 from .models import _log
 
@@ -13,6 +14,14 @@ class Pack:
         self.timer = timer
         self.future = future
 
+    def _clean(self):
+        if self.task:
+            self.task.cancel()
+        if self.timer:
+            self.timer.cancel()
+        future = self.future
+        if future and not future.done():
+            future.set_result(ProactiveEventResult.KILL)
 
 class ProactiveManager:
     """
@@ -95,12 +104,8 @@ class ProactiveManager:
         """
         pack = self._tasks.pop(chat_id, None)
         if pack:
-            timer = pack.timer
-            timer.cancel()
-            future = pack.future
-            if future and not future.done():
-                future.set_result(ProactiveEventResult.KILL)
-                _log(enable_log, "info", f"[ProactiveMgr] {chat_id} 主动任务已被外部 Kill。")
+            pack._clean()
+            _log(enable_log, "info", f"[ProactiveMgr] {chat_id} 主动任务已被外部 Kill。")
 
     # ==========================================
     # 内部方法
@@ -163,7 +168,8 @@ class ProactiveManager:
                 return
 
             # 2. 伪造 Event
-            fake_event = self._build_fake_event(skin, task.instruction)
+            decorated_prompt = PROMPT4MENTALPULL(task)
+            fake_event = self._build_fake_event(skin, decorated_prompt)
             if not fake_event:
                 return
 
@@ -224,13 +230,6 @@ class ProactiveManager:
     async def terminate(self):
         """插件卸载时清理所有等待中的主动任务"""
         for _, pack in self._tasks.items():
-            if pack.task:
-                pack.task.cancel()
-            if pack.timer:
-                pack.timer.cancel()
-            future = pack.future
-            if future and not future.done():
-                future.set_result(ProactiveEventResult.KILL)
-                
+            pack._clean()
         self._tasks.clear()
         _log(enable_log, "info", "[ProactiveMgr] 已清理所有等待中的主动任务。")
