@@ -2,19 +2,27 @@ import asyncio
 from typing import Dict
 
 from .prompt_template import PROMPT4MENTALPULL
-from .models import SessionSkin, ProactiveEventResult, ProactiveTask
+from .models import ProactiveEventResult, ProactiveTask
 from .models import _log
+from .Event_Forger import EventForger
 
 # ====== 日志开关：True 打印所有日志，False 静默 ======
 enable_log = True
 
+
 class Pack:
+    """主动任务元数据包。
+    
+    封装一个主动说话任务所需的三个协程对象：
+    task（执行 Worker）、timer（计时器）、future（执行凭证）。
+    """
     def __init__(self, delay_task: asyncio.Task, timer: asyncio.Task, future: asyncio.Future):
         self.task = delay_task
         self.timer = timer
         self.future = future
 
     def _clean(self):
+        """清理本任务的所有协程资源：取消 task 和 timer，若 future 未完成则设为 KILL。"""
         if self.task:
             self.task.cancel()
         if self.timer:
@@ -23,22 +31,24 @@ class Pack:
         if future and not future.done():
             future.set_result(ProactiveEventResult.KILL)
 
+
 class ProactiveManager:
+    """主动说话任务管理器（大总管）。
+    
+    负责管理所有主动说话任务的延迟下发、计时、凭证控制与最终推流执行。
+    每个 chat_id 同一时刻最多只有一个待执行的主动任务（新任务会覆盖旧任务）。
     """
-    ProactiveMgr的全权大总管。
-    负责管理所有的主动任务（定时器、凭证、推流执行）
-    """
-    def __init__(self, context):
+    def __init__(self, context, forger: EventForger):
         """
-        初始化ProactiveMgr大总管。
+        初始化主动任务管理器。
         
         Args:
             context: AstrBot 的主上下文，用于推流。
+            forger: EventForger 实例，用于伪造主动说话的 Event。
         """
         self._context = context
-        self._skins: Dict[str, SessionSkin] = {}              # 按 chat_id 存储外壳
-        
-        # 核心字典：chat_id -> 任务元数据
+        self.forger = forger
+        # 核心字典：chat_id -> Pack
         # task: 真正的 asyncio.Task
         # future: 控制它是否执行的“执行凭证”
         self._tasks: Dict[str, Pack] = {}
@@ -49,14 +59,13 @@ class ProactiveManager:
 
     def submit_delay_task(self, task: ProactiveTask) -> None:
         """
-        提交一个延迟执行的ProactiveMgr任务。
+        提交一个延迟执行的主动说话任务。
         
-        这是一个极简接口，外部（如 main.py 的钩子）调用它后不管
-        大总管内部会自动处理计时、劫持和推流。
+        这是一个极简接口，外部（如 main.py 的钩子）调用后无需再管。
+        内部会自动处理计时、凭证裁决和推流。
         
         Args:
-            task: ProactiveTask任务
-            
+            task: ProactiveTask 任务实例。
         """
         # 1. 如果有旧任务，先静默杀掉（新任务覆盖旧任务，解决时序竞态问题）
         chat_id = task.chat_id
@@ -65,39 +74,18 @@ class ProactiveManager:
         # 2. 创建执行凭证（默认阻塞，等待大总管的裁决）
         future = asyncio.Future()
         
-        # 3. 创建worker，用future绑定worker
+        # 3. 创建 worker，用 future 绑定 worker
         delay_task = asyncio.create_task(self._task_worker(task, future))
         timer = asyncio.create_task(self._timer_handler(task.delay, future))
         self._tasks[chat_id] = Pack(delay_task, timer, future)
         
         _log(enable_log, "info", f"[ProactiveMgr] {chat_id} 已提交主动任务，延迟 {task.delay}秒。")
 
-    def update_skin(self, chat_id: str, event) -> None:
-        """
-        从真实的 Event 中提取静态特征，更新或创建会话壳。
-        由 Plugin 层调用。
-        """
-        if chat_id not in self._skins:
-            self._skins[chat_id] = SessionSkin()
-            
-        skin = self._skins[chat_id]
-        skin.platform_meta = event.platform_meta
-        skin.msg_type = event.get_message_type()
-        skin.self_id = event.get_self_id()
-        skin.session_id = event.get_session_id()
-        skin.group_id = event.get_group_id()
-        skin.sender = event.message_obj.sender
-        skin.unified_msg_origin = event.unified_msg_origin
-
-        if skin.bot is None:
-            skin.bot = getattr(event, 'bot', None)
-            if skin.bot:
-                _log(enable_log, "info", f"[ProactiveMgr] 已缓存 {chat_id} 的Bot对象。")
-
     def cancel_task(self, chat_id: str) -> None:
         """
-        主动取消某个会话的主动任务。
-        通常在用户发了真消息，或者用户重新开始打字时调用。
+        主动取消某个会话的待执行主动任务。
+        
+        通常在用户发了新消息、或用户重新开始打字时调用，避免旧任务干扰当前对话。
         
         Args:
             chat_id: 会话 ID。
@@ -113,7 +101,11 @@ class ProactiveManager:
 
     async def _timer_handler(self, delay: float, future: asyncio.Future):
         """
-        底层计时器。时间一到，唤醒 Worker 去拿凭证。
+        底层计时器：sleep 指定秒数后，将 future 设为 PROCESS 以唤醒 Worker。
+        
+        Args:
+            delay: 延迟秒数。
+            future: 与 Worker 绑定的凭证 Future。
         """
         if not future:
             return
@@ -134,22 +126,26 @@ class ProactiveManager:
                            future: asyncio.Future # 凭证
                            ):
         """
-        底层执行器：等待 -> 唤醒 -> 检查凭证 -> 推流。
+        底层执行器：等待凭证 -> 被唤醒 -> 检查凭证结果 -> 决定是否推流。
+        
+        Args:
+            task: 主动说话任务。
+            future: 控制是否执行的凭证 Future。
         """
         if not future:
             _log(enable_log, "info", f"[ProactiveMgr] {task.chat_id} 凭证已消费或异常，跳过推流。")
             self._tasks.pop(task.chat_id, None)
             return
         
-        # 看看future
-        result = await future  # 等待result
+        # 看看 future
+        result = await future  # 等待 result
 
         # 醒来了
-        # Future给进，事件触发
+        # Future 给进，事件触发
         if result == ProactiveEventResult.PROCESS:
             _log(enable_log, "info", f"[ProactiveMgr] {task.chat_id} 凭证有效，准备推流。")
             await self._do_send(task)
-        # 被Kill了，就不发送了
+        # 被 Kill 了，就不发送了
         elif result == ProactiveEventResult.KILL:
             _log(enable_log, "info", f"[ProactiveMgr] {task.chat_id} 凭证被 Kill，任务静默抛弃。")
 
@@ -158,77 +154,43 @@ class ProactiveManager:
 
     async def _do_send(self, task: ProactiveTask):
         """
-        真正执行伪造 Event 并推入流水线。
+        真正执行伪造 Event 并推入 AstrBot 主事件队列。
+        
+        流程：
+        1. 检查会话壳是否就绪。
+        2. 用 EventForger 伪造 Event，并打上主动推流标签。
+        3. 推入 AstrBot 主事件队列。
+        
+        Args:
+            task: 主动说话任务。
         """
         try:
             # 1. 获取会话壳
-            skin = self._skins[task.chat_id]
+            skin = self.forger.get_skin(task.chat_id)
             if not skin or not skin.is_ready():
                 _log(enable_log, "warning", f"[ProactiveMgr] {task.chat_id} 会话壳未就绪，取消推流。")
                 return
 
             # 2. 伪造 Event
             decorated_prompt = PROMPT4MENTALPULL(task)
-            fake_event = self._build_fake_event(skin, decorated_prompt)
+            fake_event = self.forger.forge_event(task.chat_id, decorated_prompt)
             if not fake_event:
                 return
+            
 
+            fake_event.set_extra("is_implicit_proactive", True) # 主动推流标签
+            fake_event.is_at_or_wake_command = True
+            fake_event.is_wake = True
             # 3. 推入 AstrBot 主事件队列
-            # Care: 要是更新了这个方法说不定不行了，要关注
-            self._context._event_queue.put_nowait(fake_event)
+            # Care: 关注更新，此处使用了 context.get_event_queue   #7修改
+            await self._context.get_event_queue().put(fake_event)
             _log(enable_log, "info", f"[ProactiveMgr] {task.chat_id} 已成功推入流水线。")
 
         except Exception as e:
             _log(enable_log, "error", f"[ProactiveMgr] {task.chat_id} 伪造 Event 或推流失败: {e}", exc_info=True)
 
-    def _build_fake_event(self, skin, prompt: str):
-        try:
-            fake_msg_obj = skin.clone_message_obj(prompt=prompt)
-            platform_name = skin.platform_meta.name
-            fake_event = None
-            
-            if platform_name == "aiocqhttp":
-                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-                
-                if not skin.bot:
-                    _log(enable_log, "error", "[ProactiveMgr] 缓存的 Bot 客户端为空，无法伪造 aiocqhttp Event。")
-                    return None
-                    
-                fake_event = AiocqhttpMessageEvent(
-                    message_str=prompt,
-                    message_obj=fake_msg_obj,
-                    platform_meta=skin.platform_meta,
-                    session_id=skin.session_id,
-                    bot=skin.bot 
-                )
-            else:
-                from astrbot.core.platform.astr_message_event import AstrMessageEvent
-                fake_event = AstrMessageEvent(
-                    message_str=prompt,
-                    message_obj=fake_msg_obj,
-                    platform_meta=skin.platform_meta,
-                    session_id=skin.session_id,
-                )
-                _log(enable_log, "warning", f"[ProactiveMgr] 平台 {platform_name} 暂不支持ProactiveMgr降级处理。")
-            
-            fake_event.set_extra("is_implicit_proactive", True)
-            fake_event.is_at_or_wake_command = True
-            fake_event.is_wake = True
-            
-            return fake_event
-
-        except Exception as e:
-            _log(enable_log, "error", f"[ProactiveMgr] 伪造 Event 失败: {e}", exc_info=True)
-            return None
-
-
-
-    def get_skin(self, chat_id: str) -> 'SessionSkin | None':
-        """获取指定会话的壳"""
-        return self._skins.get(chat_id)
-
     async def terminate(self):
-        """插件卸载时清理所有等待中的主动任务"""
+        """插件卸载时清理所有等待中的主动任务。"""
         for _, pack in self._tasks.items():
             pack._clean()
         self._tasks.clear()
