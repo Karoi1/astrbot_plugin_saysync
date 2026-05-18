@@ -250,7 +250,44 @@ class SessionSkin:
         msg_obj.message_str = prompt
         
         # 动态特征：伪造防御性数据，防止底层报错
-        msg_obj.raw_message = {} 
-        msg_obj.message_id = str(uuid.uuid4()) # 必须生成全新的 ID
+        fake_id = uuid.uuid4().int & ((1 << 31) - 1)
+        msg_obj.message_id = str(fake_id)
+
+        raw = {
+            "self_id": int(self.self_id),
+            "user_id": int(self.sender.user_id) if self.sender else 0,
+            "time": int(time.time()),
+            "message_id": fake_id,
+            "message_seq": fake_id,
+            "real_id": fake_id,
+            "real_seq": "",
+            "sender": {
+                "user_id": int(self.sender.user_id) if self.sender else 0,
+                "nickname": self.sender.nickname if self.sender else "",
+                "card": "",
+            },
+            "raw_message": prompt,
+            "font": 14,
+            "message": [{"type": "text", "data": {"text": prompt}}],
+            "message_format": "array",
+            "post_type": "message",
+        }
+
+        if self.msg_type == MessageType.GROUP_MESSAGE:
+            raw["message_type"] = "group"
+            raw["sub_type"] = "normal"
+            raw["sender"]["role"] = "member"
+            raw["group_id"] = int(self.group.group_id) if self.group else 0
+            raw["group_name"] = self.group.group_name if self.group else ""
+        elif self.msg_type == MessageType.FRIEND_MESSAGE:
+            raw["message_type"] = "private"
+            raw["sub_type"] = "friend"
+            raw["target_id"] = int(self.self_id)
+        else:
+            raw["message_type"] = "private"
+            raw["sub_type"] = "friend"
+            raw["target_id"] = int(self.self_id)
+
+        msg_obj.raw_message = raw
         
         return msg_obj

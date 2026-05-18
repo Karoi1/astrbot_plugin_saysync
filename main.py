@@ -2,12 +2,15 @@ import time
 import re
 import json
 import ast
+import os
 
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api.provider import ProviderRequest, LLMResponse
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 from .core import EventForger, ProactiveManager
+from .signals import SignalContext, get_default_router
 from .core.prompt_template import MesPack2prompt, PROMPT4ENV, PROMPT4MENTALPUSH, PROMPT4IMPULSE
 from .core import SessionScheduler
 from .core.models import *
@@ -46,11 +49,14 @@ class SaySync(Star):
             context=self.context,
             forger=self.forger
         )
+        self.signal_router = get_default_router(
+            data_dir=os.path.join(get_astrbot_data_path(), "plugin_data", "astrbot_plugin_saysync")
+        )
 
     # ==========================================
     # 接线员 A & B：事件总入口
     # ==========================================
-    @filter.event_message_type(filter.EventMessageType.PRIVATE_MESSAGE, priority=-10)
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=-10)
     async def on_message(self, event: AstrMessageEvent):
         """私聊消息总入口：挂起最后一个收到的消息，实现攒批与状态感知。
         
@@ -70,7 +76,8 @@ class SaySync(Star):
 
         # --- 分支 B：处理aiocqhttp推送 ---
         if not event.message_str:
-            if self._from_aiocqhttp_update(event, chat_id):
+            result = await self._handle_platform_signal(event, chat_id)
+            if result:
                 event.stop_event()
             return
         
@@ -330,38 +337,35 @@ class SaySync(Star):
             # 字段缺失、类型转换失败、或枚举不匹配，均视为无完全匹配
             return None
 
-    def _from_aiocqhttp_update(self, event: AstrMessageEvent, chat_id: str):
-        """从 aiocqhttp 消息中提取 input_status 等 notice/notify 推送，更新用户输入状态。
+    async def _handle_platform_signal(self, event: AstrMessageEvent, chat_id: str) -> bool:
+        """将 aiocqhttp notice/notify 推送委托给 SignalRouter 分发。
+        
+        提取 raw_message 中的 go-cqhttp 原始数据，交由已注册的全部 Handler 处理。
+        当前生效的 Handler：TypingHandler（input_status）、PokeHandler 等共 12 种。
         
         Args:
             event: AstrBot 消息事件。
             chat_id: 会话唯一标识。
             
         Returns:
-            成功识别并处理状态推送返回 True，否则返回 False。
+            True 表示信号被 SignalRouter 识别并分发到了对应 Handler。
         """
         if event.get_platform_name() != "aiocqhttp":
-            return
-            
+            return False
         try:
             from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
             assert isinstance(event, AiocqhttpMessageEvent)
             raw = event.message_obj.raw_message
-            
-            if not isinstance(raw, dict):
-                return
-            
+        except Exception:
+            return False
 
-            # ========== 提取输入状态 ==========
-            if (raw.get("post_type") == "notice" and
-                raw.get("notice_type") == "notify" and
-                raw.get("sub_type") == "input_status" and "status_text" in raw):
-                
-                new_status = bool(raw["status_text"])
-                self.scheduler.update_input_state(chat_id, new_status)
-
-        except Exception as e:
-            _log(enable_log, "info", f"Error in _from_aiocqhttp_update(): {e}")
+        if not isinstance(raw, dict):
+            #logger.warning(f"aiocqhttp 推送的 raw_message 不是 dict，无法解析: {type(raw)}")
+            return False
+        #logger.info(f"收到 aiocqhttp 推送，尝试解析信号: {raw}")
+        ctx = SignalContext.from_components(self)
+        result = await self.signal_router.dispatch(raw, chat_id, ctx)
+        return result
 
     # ==========================================
     # 生命周期管理
